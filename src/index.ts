@@ -1,121 +1,101 @@
+/**
+ * @see https://vercel.com/docs/platform/limits#serverless-function-payload-size-limit
+ */
+const DEFAULT_MAX_BYTES_LENGTH = 5242880; // 5 Megabytes
+
 //#region typings
 
-type Extra = {
+type BufferResponse = Buffer | ArrayBuffer | ArrayBufferLike;
+
+type RequestResponse = {
 	statusCode: number;
 	headers?: Record<string, any>;
 };
 
-export interface IPartialRequest {
-	[key: string]: any;
+export type ContinueResponse = {
+	buffer?: BufferResponse;
+	response?: RequestResponse;
+	additional?: any;
+};
+
+export interface IResolveSourceBufferResponse {
+	buffer: BufferResponse;
+	totalLength: number;
+	additional?: any;
 }
 
-export interface IPartialResponse {
-	[key: string]: any;
-}
+export type ContinueFunction = (response: ContinueResponse) => any;
 
-export type Additional = Record<string, any> & {
-	response?: Extra;
-	error?: Extra;
-} & { buffer?: ArrayBuffer | ArrayBufferLike };
-
-export type ContinueFunction = (additional: Additional) => any;
-
-export type PartialContentOptions = {
-	maxLength?: number;
+export type Options = {
 	resolveSourceBuffer: (
 		start: number,
 		end?: number
-	) => Promise<{
-		buffer: ArrayBuffer | ArrayBufferLike;
-		totalLength: number;
-		additional?: Additional;
-	}>;
+	) => Promise<IResolveSourceBufferResponse>;
 	continue: ContinueFunction;
+	maxLength?: number;
 };
-
-//#endregion
-//#region definitions
-
-// @see https://vercel.com/docs/platform/limits#serverless-function-payload-size-limit
-const DEFAULT_MAX_BYTES_LENGTH = 5242880; // 5 Megabytes
 
 //#endregion
 //#region public methods
 
-const withPartialContent = (options: PartialContentOptions) => async (
-	req: IPartialRequest,
-	_: IPartialResponse
-) => {
-	let additional: Additional = {};
+const withPartialContent = (options: Options) => async (range: string) => {
+	const explode = range.replace(/bytes=/, "").split("-");
+	options.maxLength = options.maxLength || DEFAULT_MAX_BYTES_LENGTH;
 
-	if (typeof options.continue !== "function") {
-		throw new Error('Missing "continue" function');
-	} else if (typeof options.resolveSourceBuffer !== "function") {
-		throw new Error('Missing "resolveSourceBuffer" function');
+	let start = parseInt(explode[0], 10);
+	let end = explode[1] ? parseInt(explode[1], 10) : void 0;
+
+	start = isNaN(start) === true ? 0 : Math.max(start, 0);
+	end =
+		end !== void 0 && (isNaN(end) === true || end > options.maxLength)
+			? options.maxLength
+			: end;
+
+	const resolve = await options.resolveSourceBuffer(start, end).catch(() => {
+		return null;
+	});
+
+	if (resolve === null) {
+		return options.continue({
+			response: {
+				statusCode: 400,
+			},
+		});
 	}
 
-	const continueFn = options.continue;
-	const maxLength = Number(options.maxLength || DEFAULT_MAX_BYTES_LENGTH);
-	const rangeHeader = String(req.headers["range"] || "").trim() || null;
+	const { buffer, totalLength, additional } = resolve;
 
-	if (isNaN(maxLength) === true || rangeHeader === null) {
-		additional.error = { statusCode: 400 };
-		return continueFn(additional);
+	if (end === void 0) {
+		end = totalLength - 1;
 	}
 
-	const [rangeStart, rangeEnd] = rangeHeader.replace(/bytes=/, "").split("-");
-
-	const start = Math.min(Math.max(Number(rangeStart || 0), 0), maxLength - 1);
-	const end =
-		rangeEnd === void 0 ? "" : Math.min(Number(rangeEnd), maxLength);
-
-	if (isNaN(start) === true || (!!end && isNaN(end) === true)) {
-		additional.error = { statusCode: 400 };
-		return continueFn(additional);
+	if (end <= 0 || end > totalLength) {
+		return options.continue({
+			response: {
+				statusCode: 416,
+				headers: {
+					"Content-Range": `bytes */${totalLength}`,
+				},
+			},
+		});
 	}
 
-	if (!!end && end < start) {
-		additional.error = { statusCode: 400 };
-		return continueFn(additional);
-	}
-
-	const {
+	const continueResponse: ContinueResponse = {
 		buffer,
-		totalLength,
-		additional: resolvedAdditional = {},
-	} = await options.resolveSourceBuffer(start, end || void 0);
-
-	additional = {
-		...additional,
-		resolvedAdditional,
-	};
-
-	if (buffer === null) {
-		additional.error = { statusCode: 400 };
-		return continueFn(additional);
-	}
-
-	if (!!end && end > totalLength) {
-		additional.error = {
-			statusCode: 416,
-			headers: { "Content-Range": `bytes */${totalLength}` },
-		};
-
-		return continueFn(additional);
-	}
-
-	additional.response = {
-		statusCode: 206,
-		headers: {
-			"Content-Range": `bytes ${start}-${
-				(end || totalLength) - 1
-			}/${totalLength}`,
-			"Content-Length": buffer.byteLength,
+		response: {
+			statusCode: 206,
+			headers: {
+				"Content-Range": `bytes ${start}-${Math.min(
+					end,
+					totalLength - 1
+				)}/${totalLength}`,
+				"Content-Length": buffer.byteLength,
+			},
 		},
+		additional,
 	};
 
-	additional.buffer = buffer;
-	return continueFn(additional);
+	return options.continue(continueResponse);
 };
 
 export default withPartialContent;
